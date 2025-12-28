@@ -1,305 +1,136 @@
-import os
-import sys
-import subprocess
-import time
-import random
-import threading
+import subprocess, sys, os, asyncio, aiohttp, re, random, time, sqlite3, io, json
+from datetime import datetime
 
-# ==========================================
-# 0. SELF-INSTALLATION SYSTEM
-# ==========================================
-def install_dependencies():
-    """Checks and installs missing libraries automatically."""
+# --- 1. SYSTEM INITIALIZATION ---
+def setup():
     required = {
-        "pyTelegramBotAPI": "telebot",
-        "requests": "requests"
+        'python-telegram-bot': 'python-telegram-bot[job-queue]', 
+        'aiohttp': 'aiohttp', 
+        'requests': 'requests', 
+        'bs4': 'beautifulsoup4'
     }
-    
-    restart_needed = False
-    
-    for package, import_name in required.items():
+    for mod, pkg in required.items():
         try:
-            __import__(import_name)
+            if mod == 'bs4': import bs4
+            elif mod == 'python-telegram-bot': import telegram
+            else: __import__(mod)
         except ImportError:
-            print(f"⚙️ Installing {package}...")
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", package])
-                restart_needed = True
-            except Exception as e:
-                print(f"❌ Failed to install {package}: {e}")
-                sys.exit(1)
-                
-    if restart_needed:
-        print("✅ Dependencies installed. Restarting...")
-        os.execv(sys.executable, ['python'] + sys.argv)
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
-# Run installation check immediately
-install_dependencies()
+setup()
 
-# ==========================================
-# 1. IMPORTS & CONFIGURATION
-# ==========================================
-import telebot
-import requests
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- [ CONFIGURATION AREA ] ---
-BOT_TOKEN = "8568654046:AAGI6rVGsO_0h8qHxGP6BXQDdQMEuMkACgk"
-ADMIN_ID = 5295792382
-AUTHORIZED_USERS = {ADMIN_ID}
+# --- 2. CONFIGURATION & STATE ---
+TOKEN = "8568654046:AAGA-4X-CsNl7JPFMxMm8D1APFpuwhE9dVM"
+ADMIN_ID = 5295792382  
+DB_NAME = "janus_vault.db"
+USER_PROXIES = []
+EXCHANGE_RATES = {'GBP': 1.27, 'EUR': 1.09, 'CAD': 0.74, 'AUD': 0.66}
 
-OUTPUT_FILE = "IndoGlobal_Stores.txt"   # Stores found in this session
-HISTORY_FILE = "History.txt"            # Permanent database
-
-PROXY_LIST = []
-STOP_FLAG = False
-
-# ==========================================
-# 2. WORDLISTS (Generator Engine)
-# ==========================================
-NOUNS = [
-    "shop", "store", "boutique", "market", "outlet", "supply", "fashion", 
-    "tech", "gear", "wear", "fit", "gym", "apparel", "club", "hub", 
-    "zone", "world", "box", "crate", "spot", "place", "mart", "center",
-    "gifts", "goods", "deals", "finds", "picks", "trends", "styles"
-]
-
-ADJECTIVES = [
-    "the", "my", "your", "our", "pro", "top", "best", "super", "ultra", 
-    "mega", "hyper", "daily", "urban", "modern", "retro", "vintage", 
-    "pure", "eco", "bio", "fresh", "prime", "elite", "royal", "luxe",
-    "golden", "silver", "blue", "red", "black", "white", "green", "desi",
-    "global", "rapid", "fast", "smart", "cool", "hot"
-]
-
-ITEMS = [
-    "clothing", "jewelry", "shoes", "sneakers", "boots", "socks", 
-    "watches", "glasses", "shades", "hats", "caps", "bags", "packs",
-    "phone", "case", "skin", "led", "lamp", "decor", "art", "print",
-    "poster", "sticker", "toy", "game", "hobby", "craft", "tool",
-    "pet", "dog", "cat", "fish", "bird", "baby", "kid", "mom", "dad",
-    "saree", "kurta", "ethnic", "silk", "cotton", "spice", "tea", "tech"
-]
-
-# --- FILTER 1: LOGISTICS (India or Worldwide) ---
-SHIPPING_MARKERS = [
-    "india", "shipping to india", "ships to india", "delivery to india",
-    "delivers to india", "worldwide shipping", "international shipping", 
-    "ships worldwide", "global delivery", "free shipping worldwide"
-]
-
-# --- FILTER 2: ECONOMY (USD or INR) ---
-CURRENCY_MARKERS = [
-    "usd", "$", "us dollar", "united states", # USD Group
-    "inr", "₹", "rupee", "rs."                # INR Group
-]
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
-]
-
-# Initialize Bot
-try:
-    bot = telebot.TeleBot(BOT_TOKEN)
-except Exception as e:
-    print(f"❌ Bot Token Error: {e}")
-    sys.exit()
-
-# ==========================================
-# 3. CORE FUNCTIONS
-# ==========================================
-def is_auth(uid):
-    return int(uid) in AUTHORIZED_USERS
-
-def get_random_ua():
-    return random.choice(USER_AGENTS)
-
-def load_history():
-    if not os.path.exists(HISTORY_FILE): return set()
-    with open(HISTORY_FILE, "r") as f:
-        return set(line.strip() for line in f)
-
-def save_history(url):
-    with open(HISTORY_FILE, "a") as f:
-        f.write(url + "\n")
-
-def generate_domain():
-    """Generates a random Shopify domain."""
-    adj = random.choice(ADJECTIVES)
-    item = random.choice(ITEMS)
-    noun = random.choice(NOUNS)
-    
-    p = random.randint(1, 5)
-    if p == 1: name = f"{adj}{item}"
-    elif p == 2: name = f"{item}{noun}"
-    elif p == 3: name = f"{adj}-{item}"
-    elif p == 4: name = f"{item}-{noun}"
-    elif p == 5: name = f"{adj}{item}{noun}"
-    
-    return f"https://{name}.myshopify.com"
-
-def check_target_criteria(url):
-    """
-    DOUBLE LOCK FILTER:
-    1. Must be LIVE (200 OK)
-    2. Must ship to INDIA (or Worldwide)
-    3. Must use USD ($) or INR (₹)
-    """
-    current_proxy = None
-    proxies = None
-    
-    if PROXY_LIST:
-        current_proxy = random.choice(PROXY_LIST)
-        proxies = {"http": current_proxy, "https": current_proxy}
-
-    try:
-        r = requests.get(url, 
-                         headers={'User-Agent': get_random_ua()}, 
-                         proxies=proxies, 
-                         timeout=5)
-        
-        # --- A. LIVENESS CHECK ---
-        if r.status_code != 200: return False
-        if "/password" in r.url: return False
-        text_lower = r.text.lower()
-        if "opening soon" in text_lower or "be right back" in text_lower: return False
-        
-        # --- B. LOGISTICS CHECK (India/Global) ---
-        has_shipping = False
-        for s_marker in SHIPPING_MARKERS:
-            if s_marker in text_lower:
-                has_shipping = True
-                break
-        if not has_shipping: return False # Fail if no shipping match
-        
-        # --- C. CURRENCY CHECK (USD/INR) ---
-        has_currency = False
-        for c_marker in CURRENCY_MARKERS:
-            if c_marker in text_lower:
-                has_currency = True
-                break
-        if not has_currency: return False # Fail if no currency match
-        
-        # Passed all 3 gates
-        return True
-
-    except Exception:
-        # Auto-remove dead proxy
-        if current_proxy and current_proxy in PROXY_LIST:
-            try: PROXY_LIST.remove(current_proxy)
-            except: pass
-        return False
-
-# ==========================================
-# 4. SCANNER LOOP
-# ==========================================
-def scanner(cid, limit):
-    global STOP_FLAG
-    STOP_FLAG = False
-    
-    bot.send_message(cid, f"[*] **MULTI-VECTOR SCAN STARTED**\nTarget: {limit} Stores\nReq: Live + India Shipping + USD/INR")
-    
-    history = load_history()
-    
-    # Clear session file
-    with open(OUTPUT_FILE, "w") as f: f.write("")
-    
-    new_found = 0
-    checked = 0
-    
-    while new_found < limit:
-        if STOP_FLAG: break
-        
-        # Generate batch
-        batch = [generate_domain() for _ in range(10)]
-        
-        for url in batch:
-            if new_found >= limit: break
-            if STOP_FLAG: break
-            
-            checked += 1
-            
-            if url in history: continue
-            
-            # RUN THE DOUBLE LOCK FILTER
-            if check_target_criteria(url):
-                new_found += 1
-                
-                # Save
-                history.add(url)
-                save_history(url)
-                
-                # Write
-                with open(OUTPUT_FILE, "a") as f: f.write(url + "\n")
-                
-                # Notify
-                try: bot.send_message(cid, f"🟢 {url} (Valid)")
-                except: time.sleep(1)
-            
-            time.sleep(0.05)
-            
-    msg = "🛑 STOPPED" if STOP_FLAG else "✅ COMPLETED"
-    bot.send_message(cid, f"{msg}\nChecked: {checked}\nFound: {new_found} (India + USD/INR)")
-    
-    # Auto-Send File
-    if os.path.exists(OUTPUT_FILE) and os.path.getsize(OUTPUT_FILE) > 0:
-        with open(OUTPUT_FILE, "rb") as f:
-            bot.send_document(cid, f, caption="Targeted Live Stores")
-
-# ==========================================
-# 5. COMMANDS
-# ==========================================
-@bot.message_handler(commands=['start'])
-def start(m):
-    if is_auth(m.from_user.id):
-        text = (
-            "🌍 **INDO-GLOBAL HUNTER**\n\n"
-            "1. `/scan 100` - Find stores shipping to India with USD/INR\n"
-            "2. `/stop` - Stop scanning\n"
-            "3. `/setpx IP:PORT` - Add Proxy (Optional)"
-        )
-        bot.reply_to(m, text, parse_mode="Markdown")
-
-@bot.message_handler(commands=['setpx'])
-def setpx(m):
-    if is_auth(m.from_user.id):
-        try:
-            raw = m.text.split()[1]
-            if '@' not in raw and len(raw.split(':')) == 4:
-                p = raw.split(':')
-                fmt = f"http://{p[2]}:{p[3]}@{p[0]}:{p[1]}"
-            elif '@' in raw or 'http' in raw:
-                fmt = raw if 'http' in raw else f"http://{raw}"
-            else:
-                fmt = f"http://{raw}"
-            
-            PROXY_LIST.append(fmt)
-            bot.reply_to(m, f"✅ Proxy Added. Total: {len(PROXY_LIST)}")
-        except:
-            bot.reply_to(m, "Format: /setpx IP:PORT")
-
-@bot.message_handler(commands=['scan'])
-def scan(m):
-    if is_auth(m.from_user.id):
-        try: limit = int(m.text.split()[1])
-        except: limit = 100
-        threading.Thread(target=scanner, args=(m.chat.id, limit)).start()
-        bot.reply_to(m, f"🚀 Hunting {limit} targets...")
-
-@bot.message_handler(commands=['stop'])
-def stop(m):
-    global STOP_FLAG
-    STOP_FLAG = True
-    bot.reply_to(m, "Stopping...")
-
-# ==========================================
-# 6. RUN LOOP
-# ==========================================
-if __name__ == "__main__":
-    print("--- INDO-GLOBAL HUNTER RUNNING ---")
+# --- 3. PROXY ENGINE (Background Loop) ---
+async def proxy_scraper_loop():
+    global USER_PROXIES
+    sources = [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000",
+        "https://www.proxy-list.download/api/v1/get?type=http",
+        "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt"
+    ]
     while True:
+        new_proxies = []
+        async with aiohttp.ClientSession() as session:
+            for url in sources:
+                try:
+                    async with session.get(url, timeout=15) as resp:
+                        text = await resp.text()
+                        found = [f"http://{p.strip()}" for p in text.split('\n') if ":" in p]
+                        new_proxies.extend(found)
+                except: continue
+        if new_proxies:
+            USER_PROXIES = list(set(new_proxies))
+        await asyncio.sleep(1800)
+
+# --- 4. CORE UTILITIES ---
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute('CREATE TABLE IF NOT EXISTS hits (url TEXT PRIMARY KEY, timestamp DATETIME)')
+    conn.close()
+
+def is_duplicate(url):
+    conn = sqlite3.connect(DB_NAME)
+    res = conn.execute('SELECT 1 FROM hits WHERE url = ?', (url,)).fetchone()
+    conn.close()
+    return res is not None
+
+def save_hit(url):
+    conn = sqlite3.connect(DB_NAME)
+    conn.execute('INSERT INTO hits VALUES (?, ?)', (url, datetime.now()))
+    conn.commit()
+    conn.close()
+
+def clean_url_extractor(text):
+    pattern = r'(https?://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'
+    raw_found = re.findall(pattern, text)
+    clean = []
+    for url in raw_found:
         try:
-            bot.infinity_polling(timeout=10, long_polling_timeout=5)
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(5)
+            normalized = url.lower().split('//')[0] + "//" + url.lower().split('//')[1].split('/')[0]
+            normalized = normalized.replace("http://", "https://")
+            if normalized not in clean: clean.append(normalized)
+        except: continue
+    return sorted(clean)
+
+def authorized_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_user.id != ADMIN_ID:
+            return await update.message.reply_text("🚫 Unauthorized.")
+        return await func(update, context)
+    return wrapper
+
+# --- 5. AUDIT ENGINE (With Dual-Retry) ---
+async def audit_engine(session, url, retries=2):
+    headers = {'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X)'}
+    for attempt in range(retries + 1):
+        proxy = random.choice(USER_PROXIES) if USER_PROXIES else None
+        try:
+            if is_duplicate(url): return "dup"
+            async with session.get(url, headers=headers, proxy=proxy, timeout=10) as resp:
+                html = (await resp.text()).lower()
+                if 'stripe.com' in html or ('paypal' not in html and 'shop-pay' not in html): return "fail"
+                async with session.get(f"{url}/products.json?limit=1", headers=headers, proxy=proxy, timeout=8) as p_resp:
+                    data = await p_resp.json()
+                    price = float(data['products'][0]['variants'][0]['price'])
+                    cur_match = re.search(r'"currency":"([A-Z]{3})"', html)
+                    currency = cur_match.group(1).upper() if cur_match else "USD"
+                    usd_val = price * EXCHANGE_RATES.get(currency, 1.0)
+                    if usd_val > 20.0: return "fail"
+                    save_hit(url)
+                    return f"🎯 **HIT**: {url} (${usd_val:.2f} USD)"
+        except:
+            if attempt < retries: continue
+            return "dead"
+    return "dead"
+
+# --- 6. COMMANDS ---
+@authorized_only
+async def hunt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2: return await update.message.reply_text("❌ `/hunt [count] [keyword]`")
+    count, keyword = int(context.args[0]), context.args[1]
+    targets = [f"https://{keyword}{i}.myshopify.com" for i in range(1, count + 1)]
+    await run_scanner(update, targets, f"Hunt_{keyword}")
+
+@authorized_only
+async def site(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args) if context.args else ""
+    if update.message.reply_to_message and update.message.reply_to_message.document:
+        doc = await update.message.reply_to_message.document.get_file()
+        text = (await doc.download_as_bytearray()).decode('utf-8', errors='ignore')
+    targets = clean_url_extractor(text)
+    if not targets: return await update.message.reply_text("❌ No URLs found.")
+    await run_scanner(update, targets, "Site_Audit")
+
+async def run_scanner(update, targets, mode):
+    session_hits = []
+    stats = {"hits": 0, "dead": 0, "dup": 0, "fail": 0}
+    status_msg = await update.message.reply_text(f"🚀 **Batch: {mode}**")
